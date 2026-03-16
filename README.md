@@ -2,6 +2,9 @@
 
 ESHome-based integration for eSolution Charging Easy Wallbox using BLE.
 
+> [!NOTE]
+> This project is actively under development. We are currently working on decoding all available raw data from the charger to provide more sensors and controls.
+
 ## Overview
 
 This project allows for remote monitoring and control of the Easy Wallbox charger without the need for the official mobile app. All BLE communication logic is implemented directly within ESPHome for stability and performance.
