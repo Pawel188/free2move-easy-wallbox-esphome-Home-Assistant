@@ -1,30 +1,30 @@
-# Plan Dokumentacji Projektu Easy Wallbox ESPHome
+# Documentation Development Plan
 
-Ten dokument opisuje plan rozwoju dokumentacji dla projektu integracji ładowarki Easy Wallbox.
+This document outlines the planned documentation roadmap for the Easy Wallbox ESPHome project.
 
-## 1. Dokumentacja Techniczna (Protokół BLE)
-**Cel:** Opisanie sposobu komunikacji z ładowarką dla deweloperów chcących rozbudować projekt.
-- Opis UUID serwisów i charakterystyk.
-- Lista komend tekstowych (np. `$BLE,AUTH,7917`, `$DATA,READ,SV`).
-- Sposób parsowania odpowiedzi (bufferowanie fragmentów, regexy).
+## 1. Technical Documentation (BLE Protocol)
+**Goal:** Describe the communication protocol for developers wishing to extend the project.
+- Service and Characteristic UUID descriptions.
+- List of text commands (e.g., `$BLE,AUTH,7917`, `$DATA,READ,SV`).
+- Response parsing logic (fragment buffering, data structures).
 
-## 2. Instrukcja Użytkownika (Hardware)
-**Cel:** Pomoc w doborze i przygotowaniu sprzętu.
-- Rekomendowane moduły ESP32 (dlaczego S3 jest lepszy ze względu na antenę i RAM).
-- Schemat połączenia (zasilanie).
-- Wskazówki dotyczące zasięgu BLE w garażu.
+## 2. Hardware Guide
+**Goal:** Assist in hardware selection and preparation.
+- Recommended ESP32 modules (S3 is preferred for antenna and memory).
+- Wiring and power supply tips.
+- BLE range optimization for garage environments.
 
-## 3. Przewodnik Konfiguracji Home Assistant
-**Cel:** Wykorzystanie pełnego potencjału integracji w HA.
-- Przykładowa karta Dashboard (Lovelace).
-- Automatyzacje (np. ładowanie tylko z fotowoltaiki).
-- Integracja z Energy Dashboard.
+## 3. Home Assistant Configuration Guide
+**Goal:** Maximize integration potential within HA.
+- Example Dashboard (Lovelace) cards.
+- Automation examples (e.g., solar-only charging).
+- Energy Dashboard integration.
 
-## 4. Rozwiązywanie Problemów (Troubleshooting)
-**Cel:** Samodzielna naprawa najczęstszych błędów.
-- Logi ESPHome – jak interpretować błędy AUTH czy timeouty BLE.
-- Resetowanie powiązania (bonding) – obsługa usługi `remove_bond_and_reconnect`.
-- Problemy z zasięgiem i zakłóceniami WiFi/Bluetooth.
+## 4. Troubleshooting
+**Goal:** Self-service for common issues.
+- Interpreting ESPHome logs (AUTH errors, BLE timeouts).
+- Resetting bonding - using the `remove_bond_and_reconnect` service.
+- WiFi/Bluetooth interference issues.
 
 ---
-**Status:** Planowanie zakończone. Dokumentacja będzie powstawać etapami wraz z rozwojem repozytorium.
+**Status:** Planning complete. Documentation will be developed in stages alongside repository updates.
