@@ -14,12 +14,19 @@ Ten projekt pozwala na zdalne monitorowanie i sterowanie ładowarką Easy Wallbo
 - **Status DPM**: Przełącznik funkcji Dynamic Power Management.
 - **Natywna Integracja**: Pełna kompatybilność z Home Assistant przez API ESPHome.
 
-## Instalacja
+## Kody PIN / PIN Codes
+
+Ważne: Ładowarka wykorzystuje dwa poziomy zabezpieczeń (BLE Passkey i Komenda AUTH). Szczegóły znajdziesz w pliku [PIN_GUIDE.md](./PIN_GUIDE.md).
+*Important: The charger uses two security levels (BLE Passkey and AUTH Command). See [PIN_GUIDE.md](./PIN_GUIDE.md) for details.*
+
+## Instalacja / Installation
 
 1. Skopiuj plik `easywallbox-proxy.yaml` oraz `secrets.yaml.example` do swojego folderu ESPHome.
 2. Zmień nazwę `secrets.yaml.example` na `secrets.yaml` i uzupełnij swoje dane (WiFi, klucze API).
-3. Skompiluj i wgraj oprogramowanie na swoje urządzenie ESP32 (rekomendowany ESP32-S3).
-4. Dodaj urządzenie w Home Assistant.
+3. **Ustal swój PIN** w pliku YAML (sekcja `on_connect` oraz `on_passkey_request`). Domyślnie ustawiono `7917`.
+4. Skompiluj i wgraj oprogramowanie na swoje urządzenie ESP32 (rekomendowany ESP32-S3).
+5. Dodaj urządzenie w Home Assistant.
+
 
 ## Dokumentacja
 
