@@ -1,0 +1,465 @@
+esphome:
+  name: easywallbox-proxy
+  friendly_name: Easy Wallbox Controller
+  on_boot:
+    priority: -200
+    then:
+      - lambda: |-
+          // Konfiguracja parametrów bezpieczeństwa BLE (passkey=001234, MITM+BOND)
+          esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_MITM_BOND;
+          esp_ble_io_cap_t iocap = ESP_IO_CAP_KBDISP;
+          uint8_t key_size = 16;
+          uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+          uint32_t passkey = 1234;
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
+          esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(uint8_t));
+          ESP_LOGI("ble_sec", "BLE security params set (passkey=001234)");
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+esp32_ble:
+  setup_priority: -100
+  io_capability: keyboard_only
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  services:
+    - service: send_command
+      variables:
+        cmd: string
+      then:
+        - ble_client.ble_write:
+            id: wallbox_client
+            service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+            characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+            value: !lambda 'return std::vector<uint8_t>(cmd.begin(), cmd.end());'
+    - service: remove_bond_and_reconnect
+      then:
+        - logger.log: "Usuwam bonding BLE i wymuszam ponowne parowanie..."
+        - ble_client.remove_bond:
+            id: wallbox_client
+        - delay: 2s
+        - ble_client.disconnect:
+            id: wallbox_client
+        - delay: 3s
+        - ble_client.connect:
+            id: wallbox_client
+
+ota:
+  platform: esphome
+
+# ===== GLOBALS - buforowanie fragmentów BLE =====
+globals:
+  - id: tx_buffer
+    type: std::string
+    initial_value: '""'
+  - id: wallbox_auth_ok
+    type: bool
+    initial_value: 'false'
+  - id: dpm_state
+    type: bool
+    initial_value: 'false'
+
+# ===== BLE =====
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1.1s
+    window: 1.0s
+    active: true
+
+ble_client:
+  - mac_address: 5C:C7:C1:FF:ED:C3
+    id: wallbox_client
+    on_passkey_request:
+      then:
+        - logger.log: "Ładowarka żąda PINu parowania — wysyłam 001234..."
+        - ble_client.passkey_reply:
+            id: wallbox_client
+            passkey: 1234
+    on_connect:
+      then:
+        - logger.log: "Połączono! Wymuszam szyfrowanie BLE..."
+        - lambda: |-
+            esp_bd_addr_t remote_bda = {0x5C, 0xC7, 0xC1, 0xFF, 0xED, 0xC3};
+            esp_ble_set_encryption(remote_bda, ESP_BLE_SEC_ENCRYPT_MITM);
+        - delay: 8s
+        - logger.log: "Wysyłam AUTH: $BLE,AUTH,7917"
+        - ble_client.ble_write:
+            id: wallbox_client
+            service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+            characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+            value: [0x24, 0x42, 0x4C, 0x45, 0x2C, 0x41, 0x55, 0x54, 0x48, 0x2C, 0x37, 0x39, 0x31, 0x37, 0x0A]
+    on_disconnect:
+      then:
+        - logger.log: "Rozłączono z ładowarką!"
+        - lambda: 'id(wallbox_auth_ok) = false;'
+        - binary_sensor.template.publish:
+            id: wallbox_connected
+            state: false
+
+# ===== TEXT SENSOR - notyfikacje TX z buforowaniem =====
+text_sensor:
+  - platform: ble_client
+    ble_client_id: wallbox_client
+    id: wallbox_tx_raw
+    name: "Wallbox Raw Response"
+    internal: true
+    service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+    characteristic_uuid: 'a73e9a10-628f-4494-a099-12efaf72258f'
+    notify: true
+    update_interval: never
+    on_value:
+      then:
+        - lambda: |-
+            // Buforowanie fragmentów — łączenie do \n
+            id(tx_buffer) += x;
+            
+            // Szukamy zakończenia linii
+            size_t nl = id(tx_buffer).find('\n');
+            while (nl != std::string::npos) {
+              std::string line = id(tx_buffer).substr(0, nl);
+              id(tx_buffer) = id(tx_buffer).substr(nl + 1);
+              
+              ESP_LOGI("wallbox", "RX: %s", line.c_str());
+              
+              // --- Parsowanie odpowiedzi ---
+              
+              // AUTH
+              if (line.find("$BLE,AUTH,OK") != std::string::npos) {
+                ESP_LOGI("wallbox", "Autoryzacja OK!");
+                id(wallbox_auth_ok) = true;
+                id(wallbox_connected).publish_state(true);
+                id(wallbox_status).publish_state("Połączono i autoryzowano");
+              }
+              else if (line.find("$BLE,AUTH,FAIL") != std::string::npos) {
+                ESP_LOGE("wallbox", "Autoryzacja FAIL!");
+                id(wallbox_auth_ok) = false;
+                id(wallbox_status).publish_state("Błąd autoryzacji");
+              }
+              // ERR
+              else if (line.find("$ERR") != std::string::npos) {
+                ESP_LOGE("wallbox", "Błąd: %s", line.c_str());
+                id(wallbox_status).publish_state(line);
+              }
+              // DATA,READ,SV - napięcie, prąd, moc
+              else if (line.find("$DATA,READ,SV") != std::string::npos) {
+                // Format: $DATA,READ,SV,phase,val,phase,val,phase,val
+                char buf[256];
+                strncpy(buf, line.c_str(), sizeof(buf)-1);
+                buf[sizeof(buf)-1] = 0;
+                char *parts[10];
+                int i = 0;
+                char *tok = strtok(buf, ",");
+                while (tok && i < 10) { parts[i++] = tok; tok = strtok(nullptr, ","); }
+                if (i >= 9) {
+                  float current = atof(parts[4]) / 10.0f;
+                  float voltage = atof(parts[8]) / 10.0f;
+                  float power_kw = (current * voltage) / 1000.0f;
+                  
+                  id(wallbox_current).publish_state(current);
+                  id(wallbox_voltage).publish_state(voltage);
+                  id(wallbox_power).publish_state(power_kw);
+                  ESP_LOGI("wallbox", "U: %.1f V, I: %.1f A, P: %.2f kW", voltage, current, power_kw);
+                }
+              }
+              // DATA,READ,AD - app data (energia)
+              else if (line.find("$DATA,READ,AD") != std::string::npos) {
+                char buf[256];
+                strncpy(buf, line.c_str(), sizeof(buf)-1);
+                buf[sizeof(buf)-1] = 0;
+                char *parts[30];
+                int i = 0;
+                char *tok = strtok(buf, ",");
+                while (tok && i < 30) { parts[i++] = tok; tok = strtok(nullptr, ","); }
+                if (i >= 7) {
+                  // Zakładamy, że AD[3] to energia sesji w Wh (parts[6])
+                  float raw_energy = atof(parts[6]);
+                  float energy_kwh = raw_energy / 1000.0f;
+                  id(wallbox_session_energy).publish_state(energy_kwh);
+                  ESP_LOGI("wallbox", "AD Energy: %.3f kWh (RAW: %.0f)", energy_kwh, raw_energy);
+                }
+              }
+              // EEP,READ,IDX - limity
+              else if (line.find("$EEP,READ,IDX") != std::string::npos) {
+                // Format: $EEP,READ,IDX,index,value
+                char buf[256];
+                strncpy(buf, line.c_str(), sizeof(buf)-1);
+                buf[sizeof(buf)-1] = 0;
+                char *parts[8];
+                int n = 0;
+                char *tok = strtok(buf, ",");
+                while (tok && n < 8) { parts[n++] = tok; tok = strtok(nullptr, ","); }
+                if (n >= 5) {
+                  int idx = atoi(parts[3]);
+                  float amps = atof(parts[4]) / 10.0f;
+                  float kw = amps * 0.23f;
+                  if (idx == 174) {
+                    id(wallbox_user_limit).publish_state(kw);
+                    ESP_LOGI("wallbox", "User limit: %.0f A = %.1f kW", amps, kw);
+                  } else if (idx == 158) {
+                    id(wallbox_dpm_limit).publish_state(kw);
+                    ESP_LOGI("wallbox", "DPM limit: %.0f A = %.1f kW", amps, kw);
+                  } else if (idx == 178) {
+                    id(dpm_state) = (amps > 0);
+                    id(wallbox_dpm_switch).publish_state(amps > 0);
+                    ESP_LOGI("wallbox", "DPM: %s", amps > 0 ? "ON" : "OFF");
+                  }
+                }
+              }
+              // CMD,CHARGE odpowiedzi
+              else if (line.find("$CMD,CHARGE,START,OK") != std::string::npos) {
+                id(wallbox_charging).publish_state(true);
+                id(wallbox_status).publish_state("Ładowanie aktywne");
+              }
+              else if (line.find("$CMD,CHARGE,STOP,OK") != std::string::npos) {
+                id(wallbox_charging).publish_state(false);
+                id(wallbox_status).publish_state("Ładowanie zatrzymane");
+              }
+              // EEP WRITE potwierdzenia
+              else if (line.find("$EEP,WRITE,OK") != std::string::npos) {
+                ESP_LOGI("wallbox", "Zapis EEPROM OK");
+              }
+              else if (line.find("$EEP,WRITE,FAIL") != std::string::npos) {
+                ESP_LOGE("wallbox", "Zapis EEPROM FAIL");
+              }
+              
+              // Publikuj pełną odpowiedź do text sensora
+              id(wallbox_last_response).publish_state(line);
+              
+              nl = id(tx_buffer).find('\n');
+            }
+
+  - platform: ble_client
+    ble_client_id: wallbox_client
+    id: wallbox_st_raw
+    internal: true
+    service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+    characteristic_uuid: '75A9F022-AF03-4E41-B4BC-9DE90A47D50B'
+    notify: true
+    update_interval: never
+
+  - platform: template
+    name: "Wallbox Last Response"
+    id: wallbox_last_response
+
+  - platform: template
+    name: "Wallbox Status"
+    id: wallbox_status
+
+# ===== SENSORY =====
+sensor:
+  - platform: template
+    name: "Wallbox Voltage"
+    id: wallbox_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Wallbox Current"
+    id: wallbox_current
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Wallbox Power"
+    id: wallbox_power
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Wallbox Session Energy"
+    id: wallbox_session_energy
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+
+# ===== BINARY SENSORS =====
+binary_sensor:
+  - platform: template
+    name: "Wallbox Connected"
+    id: wallbox_connected
+    device_class: connectivity
+
+  - platform: template
+    name: "Wallbox Charging"
+    id: wallbox_charging
+    device_class: battery_charging
+
+# ===== SWITCH: Ładowanie Start/Stop =====
+switch:
+  - platform: template
+    name: "Wallbox Charging"
+    id: wallbox_charging_switch
+    icon: "mdi:ev-station"
+    lambda: 'return id(wallbox_charging).state;'
+    turn_on_action:
+      - logger.log: "Startuję ładowanie..."
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x43, 0x4D, 0x44, 0x2C, 0x43, 0x48, 0x41, 0x52, 0x47, 0x45, 0x2C, 0x53, 0x54, 0x41, 0x52, 0x54, 0x2C, 0x30, 0x0A]
+    turn_off_action:
+      - logger.log: "Zatrzymuję ładowanie..."
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x43, 0x4D, 0x44, 0x2C, 0x43, 0x48, 0x41, 0x52, 0x47, 0x45, 0x2C, 0x53, 0x54, 0x4F, 0x50, 0x0A]
+
+  - platform: template
+    name: "Wallbox DPM"
+    id: wallbox_dpm_switch
+    icon: "mdi:current-ac"
+    lambda: 'return id(dpm_state);'
+    turn_on_action:
+      - logger.log: "Włączam DPM..."
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x57, 0x52, 0x49, 0x54, 0x45, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x2C, 0x31, 0x0A]
+      - delay: 2s
+      # Re-read DPM status
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x0A]
+    turn_off_action:
+      - logger.log: "Wyłączam DPM..."
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x57, 0x52, 0x49, 0x54, 0x45, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x2C, 0x30, 0x0A]
+      - delay: 2s
+      # Re-read DPM status
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x0A]
+
+# ===== NUMBER: Limity mocy (kW) =====
+number:
+  - platform: template
+    name: "Wallbox User Power Limit"
+    id: wallbox_user_limit
+    icon: "mdi:flash"
+    unit_of_measurement: "kW"
+    device_class: power
+    min_value: 1.4
+    max_value: 7.4
+    step: 0.2
+    optimistic: false
+    set_action:
+      - lambda: |-
+          // kW -> A -> protokół (×10)
+          int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
+          // Zaokrąglij do pełnych amperów (×10)
+          amps_x10 = (amps_x10 / 10) * 10;
+          char cmd[40];
+          snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,174,%d\n", amps_x10);
+          ESP_LOGI("wallbox", "Set user limit: %.1f kW = %d A", x, amps_x10/10);
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: !lambda |-
+            int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
+            amps_x10 = (amps_x10 / 10) * 10;
+            char cmd[40];
+            snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,174,%d\n", amps_x10);
+            std::string s(cmd);
+            return std::vector<uint8_t>(s.begin(), s.end());
+
+  - platform: template
+    name: "Wallbox DPM Power Limit"
+    id: wallbox_dpm_limit
+    icon: "mdi:flash"
+    unit_of_measurement: "kW"
+    device_class: power
+    min_value: 1.4
+    max_value: 7.4
+    step: 0.2
+    optimistic: false
+    set_action:
+      - lambda: |-
+          int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
+          amps_x10 = (amps_x10 / 10) * 10;
+          char cmd[40];
+          snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,158,%d\n", amps_x10);
+          ESP_LOGI("wallbox", "Set DPM limit: %.1f kW = %d A", x, amps_x10/10);
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: !lambda |-
+            int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
+            amps_x10 = (amps_x10 / 10) * 10;
+            char cmd[40];
+            snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,158,%d\n", amps_x10);
+            std::string s(cmd);
+            return std::vector<uint8_t>(s.begin(), s.end());
+
+# ===== INTERVAL: Cykliczne odpytywanie =====
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(wallbox_client)->connected() && id(wallbox_auth_ok);'
+          then:
+            # Odczyt napięcia
+            - ble_client.ble_write:
+                id: wallbox_client
+                service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+                characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+                value: [0x24, 0x44, 0x41, 0x54, 0x41, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x53, 0x56, 0x0A]
+            - delay: 2s
+            # Odczyt limitu użytkownika
+            - ble_client.ble_write:
+                id: wallbox_client
+                service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+                characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+                value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x34, 0x0A]
+            - delay: 2s
+            # Odczyt statusu DPM
+            - ble_client.ble_write:
+                id: wallbox_client
+                service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+                characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+                value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x0A]
+            - delay: 2s
+            # Odczyt APP DATA (energia itp)
+            - ble_client.ble_write:
+                id: wallbox_client
+                service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+                characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+                value: [0x24, 0x44, 0x41, 0x54, 0x41, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x41, 0x44, 0x0A]
