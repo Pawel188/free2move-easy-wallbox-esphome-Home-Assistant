@@ -31,12 +31,12 @@ esp32_ble:
   io_capability: keyboard_only
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  fast_connect: true
+  networks:
+   - ssid: !secret wifi_ssid
+     password: !secret wifi_password
 
 logger:
-  level: DEBUG
+  level: WARN
 
 api:
   encryption:
@@ -77,6 +77,9 @@ globals:
   - id: dpm_state
     type: bool
     initial_value: 'false'
+  - id: wallbox_user_amps_raw
+    type: float
+    initial_value: '6.0'
 
 # ===== BLE =====
 esp32_ble_tracker:
@@ -159,9 +162,8 @@ text_sensor:
                 ESP_LOGE("wallbox", "Błąd: %s", line.c_str());
                 id(wallbox_status).publish_state(line);
               }
-              // DATA,READ,SV - napięcie, prąd, moc
+              // DATA,READ,SV - napięcie
               else if (line.find("$DATA,READ,SV") != std::string::npos) {
-                // Format: $DATA,READ,SV,phase,val,phase,val,phase,val
                 char buf[256];
                 strncpy(buf, line.c_str(), sizeof(buf)-1);
                 buf[sizeof(buf)-1] = 0;
@@ -170,17 +172,14 @@ text_sensor:
                 char *tok = strtok(buf, ",");
                 while (tok && i < 10) { parts[i++] = tok; tok = strtok(nullptr, ","); }
                 if (i >= 9) {
-                  float current = atof(parts[4]) / 10.0f;
-                  float voltage = atof(parts[8]) / 10.0f;
-                  float power_kw = (current * voltage) / 1000.0f;
+                  float raw_voltage = atof(parts[8]);
+                  float voltage = (raw_voltage >= 65535.0f || raw_voltage < 0.0f) ? 0.0f : raw_voltage / 10.0f;
                   
-                  id(wallbox_current).publish_state(current);
                   id(wallbox_voltage).publish_state(voltage);
-                  id(wallbox_power).publish_state(power_kw);
-                  ESP_LOGI("wallbox", "U: %.1f V, I: %.1f A, P: %.2f kW", voltage, current, power_kw);
+                  ESP_LOGI("wallbox", "SV Voltage: %.1f V", voltage);
                 }
               }
-              // DATA,READ,AD - app data (energia)
+              // DATA,READ,AD - app data (energia, prąd, moc)
               else if (line.find("$DATA,READ,AD") != std::string::npos) {
                 char buf[256];
                 strncpy(buf, line.c_str(), sizeof(buf)-1);
@@ -189,12 +188,35 @@ text_sensor:
                 int i = 0;
                 char *tok = strtok(buf, ",");
                 while (tok && i < 30) { parts[i++] = tok; tok = strtok(nullptr, ","); }
-                if (i >= 7) {
-                  // Zakładamy, że AD[3] to energia sesji w Wh (parts[6])
+                if (i >= 12) {
+                  // Energia sesji (Wh -> kWh)
                   float raw_energy = atof(parts[6]);
                   float energy_kwh = raw_energy / 1000.0f;
                   id(wallbox_session_energy).publish_state(energy_kwh);
-                  ESP_LOGI("wallbox", "AD Energy: %.3f kWh (RAW: %.0f)", energy_kwh, raw_energy);
+                  
+                  // Rzeczywisty prąd ładowania (10 * A -> A)
+                  float raw_current = atof(parts[10]);
+                  float current = (raw_current >= 65535.0f || raw_current < 0.0f) ? 0.0f : raw_current / 10.0f;
+                  id(wallbox_current).publish_state(current);
+                  
+                  // Rzeczywista moc ładowania (W -> kW)
+                  float raw_power = atof(parts[11]);
+                  float power_kw = (raw_power >= 65535.0f || raw_power < 0.0f) ? 0.0f : raw_power / 1000.0f;
+                  id(wallbox_power).publish_state(power_kw);
+                  
+                  // Fizyczna obecność auta na podstawie napięcia linii CP (parts[4])
+                  // Oraz dwukierunkowa synchronizacja stanu gotowości (START/STOP) ładowarki w HA na podstawie parts[14]
+                  if (i >= 15) {
+                    float cp_voltage = atof(parts[4]);
+                    int charging_ready = atoi(parts[14]);
+                    
+                    bool car_connected = (cp_voltage < 100.0f);
+                    id(wallbox_car_connected).publish_state(car_connected);
+                    
+                    id(wallbox_charging).publish_state(charging_ready == 1);
+                  }
+                  
+                  ESP_LOGI("wallbox", "AD Energy: %.3f kWh, Current: %.1f A, Power: %.2f kW", energy_kwh, current, power_kw);
                 }
               }
               // EEP,READ,IDX - limity
@@ -212,11 +234,12 @@ text_sensor:
                   float amps = atof(parts[4]) / 10.0f;
                   float kw = amps * 0.23f;
                   if (idx == 174) {
+                    id(wallbox_user_amps_raw) = amps;
                     id(wallbox_user_limit).publish_state(kw);
-                    ESP_LOGI("wallbox", "User limit: %.0f A = %.1f kW", amps, kw);
+                    ESP_LOGI("wallbox", "User limit: %.1f A = %.2f kW", amps, kw);
                   } else if (idx == 158) {
                     id(wallbox_dpm_limit).publish_state(kw);
-                    ESP_LOGI("wallbox", "DPM limit: %.0f A = %.1f kW", amps, kw);
+                    ESP_LOGI("wallbox", "DPM limit: %.1f A = %.2f kW", amps, kw);
                   } else if (idx == 178) {
                     id(dpm_state) = (amps > 0);
                     id(wallbox_dpm_switch).publish_state(amps > 0);
@@ -225,11 +248,11 @@ text_sensor:
                 }
               }
               // CMD,CHARGE odpowiedzi
-              else if (line.find("$CMD,CHARGE,START,OK") != std::string::npos) {
+              else if (line.find("$CMD,CHARGE,START") != std::string::npos) {
                 id(wallbox_charging).publish_state(true);
                 id(wallbox_status).publish_state("Ładowanie aktywne");
               }
-              else if (line.find("$CMD,CHARGE,STOP,OK") != std::string::npos) {
+              else if (line.find("$CMD,CHARGE,STOP") != std::string::npos) {
                 id(wallbox_charging).publish_state(false);
                 id(wallbox_status).publish_state("Ładowanie zatrzymane");
               }
@@ -310,6 +333,11 @@ binary_sensor:
     id: wallbox_charging
     device_class: battery_charging
 
+  - platform: template
+    name: "Wallbox Car Connected"
+    id: wallbox_car_connected
+    device_class: plug
+
 # ===== SWITCH: Ładowanie Start/Stop =====
 switch:
   - platform: template
@@ -319,13 +347,26 @@ switch:
     lambda: 'return id(wallbox_charging).state;'
     turn_on_action:
       - logger.log: "Startuję ładowanie..."
+      - binary_sensor.template.publish:
+          id: wallbox_charging
+          state: true
       - ble_client.ble_write:
           id: wallbox_client
           service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
           characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
           value: [0x24, 0x43, 0x4D, 0x44, 0x2C, 0x43, 0x48, 0x41, 0x52, 0x47, 0x45, 0x2C, 0x53, 0x54, 0x41, 0x52, 0x54, 0x2C, 0x30, 0x0A]
+      - delay: 2s
+      # Wyłączamy DPM, żeby ładowanie ruszyło (włączony DPM przy braku licznika blokuje ładowanie do 0 A)
+      - ble_client.ble_write:
+          id: wallbox_client
+          service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+          characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+          value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x57, 0x52, 0x49, 0x54, 0x45, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x38, 0x2C, 0x30, 0x0A]
     turn_off_action:
       - logger.log: "Zatrzymuję ładowanie..."
+      - binary_sensor.template.publish:
+          id: wallbox_charging
+          state: false
       - ble_client.ble_write:
           id: wallbox_client
           service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
@@ -374,26 +415,26 @@ number:
     icon: "mdi:flash"
     unit_of_measurement: "kW"
     device_class: power
-    min_value: 1.4
+    min_value: 1.38
     max_value: 7.4
     step: 0.2
     optimistic: false
     set_action:
       - lambda: |-
-          // kW -> A -> protokół (×10)
-          int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
-          // Zaokrąglij do pełnych amperów (×10)
-          amps_x10 = (amps_x10 / 10) * 10;
-          char cmd[40];
-          snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,174,%d\n", amps_x10);
-          ESP_LOGI("wallbox", "Set user limit: %.1f kW = %d A", x, amps_x10/10);
+          int amps = (int)((x / 0.23f) + 0.5f);
+          if (amps < 6) amps = 6;
+          float target_kw = amps * 0.23f;
+          id(wallbox_user_limit).publish_state(target_kw);
+          id(wallbox_user_amps_raw) = amps;
+          ESP_LOGI("wallbox", "Set user limit: %.1f kW = %d A", x, amps);
       - ble_client.ble_write:
           id: wallbox_client
           service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
           characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
           value: !lambda |-
-            int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
-            amps_x10 = (amps_x10 / 10) * 10;
+            int amps = (int)((x / 0.23f) + 0.5f);
+            if (amps < 6) amps = 6;
+            int amps_x10 = amps * 10;
             char cmd[40];
             snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,174,%d\n", amps_x10);
             std::string s(cmd);
@@ -405,24 +446,25 @@ number:
     icon: "mdi:flash"
     unit_of_measurement: "kW"
     device_class: power
-    min_value: 1.4
+    min_value: 1.38
     max_value: 7.4
     step: 0.2
     optimistic: false
     set_action:
       - lambda: |-
-          int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
-          amps_x10 = (amps_x10 / 10) * 10;
-          char cmd[40];
-          snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,158,%d\n", amps_x10);
-          ESP_LOGI("wallbox", "Set DPM limit: %.1f kW = %d A", x, amps_x10/10);
+          int amps = (int)((x / 0.23f) + 0.5f);
+          if (amps < 6) amps = 6;
+          float target_kw = amps * 0.23f;
+          id(wallbox_dpm_limit).publish_state(target_kw);
+          ESP_LOGI("wallbox", "Set DPM limit: %.1f kW = %d A", x, amps);
       - ble_client.ble_write:
           id: wallbox_client
           service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
           characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
           value: !lambda |-
-            int amps_x10 = (int)((x / 0.23f) * 10.0f + 0.5f);
-            amps_x10 = (amps_x10 / 10) * 10;
+            int amps = (int)((x / 0.23f) + 0.5f);
+            if (amps < 6) amps = 6;
+            int amps_x10 = amps * 10;
             char cmd[40];
             snprintf(cmd, sizeof(cmd), "$EEP,WRITE,IDX,158,%d\n", amps_x10);
             std::string s(cmd);
@@ -449,6 +491,13 @@ interval:
                 service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
                 characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
                 value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x37, 0x34, 0x0A]
+            - delay: 2s
+            # Odczyt limitu DPM
+            - ble_client.ble_write:
+                id: wallbox_client
+                service_uuid: '331a36f5-2459-45ea-9d95-6142f0c4b307'
+                characteristic_uuid: 'a9da6040-0823-4995-94ec-9ce41ca28833'
+                value: [0x24, 0x45, 0x45, 0x50, 0x2C, 0x52, 0x45, 0x41, 0x44, 0x2C, 0x49, 0x44, 0x58, 0x2C, 0x31, 0x35, 0x38, 0x0A]
             - delay: 2s
             # Odczyt statusu DPM
             - ble_client.ble_write:

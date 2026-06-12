@@ -6,5 +6,17 @@ secrets.yaml
 !secrets.yaml.example
 .venv/
 venv/
+venv_win/
 node_modules/
 .DS_Store
+.agent/
+.agents/
+custom_components (kopia)/
+Katalog bez nazwy/
+ostatnie wiadomosci
+easywallbox/
+custom_components/
+walkthrough.md
+dodtkowe sensory.md
+easy-wallbox-esolution-charging.md
+podsumowanie_prac.md
